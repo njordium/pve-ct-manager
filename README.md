@@ -1,6 +1,6 @@
 **An interactive Bash tool for managing LXC containers across a Proxmox VE cluster — renumber, migrate, change hostname/VLAN/IP, and verify cluster consistency from any node.**
 
-<img width="813" height="526" alt="Screenshot2026-06-27 at 13 41 37" src="https://github.com/user-attachments/assets/54fd9b2a-b632-4130-a36a-46d362548dad" />
+<img width="902" height="513" alt="Screenshot2026-06-27 at 16 24 52" src="https://github.com/user-attachments/assets/d7571356-fec4-463c-81a0-b68a72853e37" />
 
 ## Why this exists
 
