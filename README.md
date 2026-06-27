@@ -187,9 +187,9 @@ Menu option **3** queries each online node's outbound WAN IP using a fallback ch
 
   Node         Public IP          Egress IF    Service / note
   ----         ---------          ---------    ------------
-  aiwendil     79.136.21.142      vmbr0        curl ifconfig.me
-  alatar       79.136.21.142      vmbr0        curl ifconfig.me
-  curumo       79.136.21.142      vmbr0        curl ifconfig.me
+  aiwendil     ##.##.##.##      vmbr0        curl ifconfig.me
+  alatar       ##.##.##.##      vmbr0        curl ifconfig.me
+  curumo       ##.##.##.##      vmbr0        curl ifconfig.me
 
 [✓] All online nodes share the same egress public IP.
 ```
