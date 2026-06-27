@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# pct-renumber.sh — PVE LXC Container Management v1.0.0
+# pct-renumber.sh — PVE LXC Container Management v1.1.0
 # Interactive renumber, VLAN/IP change, migration for Proxmox VE clusters
 # No external deps | Team Njordium
 # Script Author: Kim Haverblad
@@ -10,10 +10,33 @@
 #
 # Requires: root on a PVE cluster node, pct, pvesh, lvm tools
 # =============================================================================
+#
+# Changelog:
+#   v1.1.0  2026-06-27
+#     - Cluster overview now shows Public IP and Egress IF as dedicated columns
+#       (populated automatically at startup via egress_probe_all_nodes)
+#     - Removed standalone "Show egress public IPs" menu option (data now
+#       always visible on the overview)
+#     - Configure flow: explicit Move vs Copy mode prompt whenever a CT ID
+#       change or target-node change is selected
+#         * Copy with new ID         -> pct clone source -> NEW_ID, source kept
+#         * Copy with same ID + node -> pct clone source -> BACKUP_ID on
+#           source (suggested 9XXXX prefix), then migrate original to target
+#         * Copy with same node + new ID -> local clone (duplicate in place)
+#     - MAC address handling: explicit prompt to regenerate or preserve.
+#       Default is preserve (critical for DHCP-assigned IPs). New MAC, when
+#       requested, uses /dev/urandom and the Proxmox BC:24:11 OUI prefix
+#     - update_net0_in_config() gains optional MAC parameter
+#     - New helpers: generate_mac(), get_current_mac(), egress_probe_all_nodes()
+#     - Operation Summary expanded with Mode, MAC, and backup ID rows
+#     - Start vs Restart prompt at completion now correctly says Start in
+#       Copy mode (clone never ran before)
+#
+# =============================================================================
 
 set -euo pipefail
 
-SCRIPT_VERSION="1.0.0"
+SCRIPT_VERSION="1.1.0"
 
 # ---------- Configuration ----------
 LOGFILE="/var/log/pct-renumber.log"
@@ -109,7 +132,7 @@ show_splash() {
     clear
     printf '%s' "$CYAN"
     cat <<'SPLASH'
-                __                                         __
+                __                                          __
     ____  _____/ /_      _________  ____  ____ _____ ___  / /_   ___  _____
    / __ \/ ___/ __/____ / ___/ __ \/ __ \/ __ `/ __ `__ \/ __ \ / _ \/ ___/
   / /_/ / /__/ /_/____// /  / /_/ / / / / /_/ / / / / / / /_/ //  __/ /
@@ -192,6 +215,8 @@ declare -A NODE_FREE_RAM_GB
 declare -A NODE_FREE_DISK_GB
 declare -A NODE_ONLINE
 declare -A NODE_IP
+declare -A NODE_PUBLIC_IP
+declare -A NODE_EGRESS_IF
 
 fmt_status() {
     local s="$1"
@@ -501,6 +526,76 @@ preflight_check() {
     echo
 }
 
+# ---------- Egress IP detection (shared) ----------
+# Self-contained shell snippet — produces "PUBLIC_IP|EGRESS_IF|METHOD" on stdout.
+EGRESS_PROBE='
+    EGRESS_IF=$(ip -4 route get 8.8.8.8 2>/dev/null | grep -oE "dev [^ ]+" | head -1 | cut -d" " -f2)
+    EGRESS_IF=${EGRESS_IF:-?}
+    PUB_IP=""
+    METHOD=""
+    for svc in ifconfig.me api.ipify.org ifconfig.co icanhazip.com; do
+        for proto in https http; do
+            if command -v curl >/dev/null 2>&1; then
+                RAW=$(curl -4 -s --max-time 5 "${proto}://${svc}" 2>/dev/null)
+                PUB_IP=$(echo "$RAW" | head -1 | tr -d "[:space:]" | grep -oE "^[0-9]{1,3}(\.[0-9]{1,3}){3}$")
+                if [ -n "$PUB_IP" ]; then METHOD="curl ${svc}"; break 2; fi
+            fi
+            if command -v wget >/dev/null 2>&1; then
+                RAW=$(wget -qO- --timeout=5 "${proto}://${svc}" 2>/dev/null)
+                PUB_IP=$(echo "$RAW" | head -1 | tr -d "[:space:]" | grep -oE "^[0-9]{1,3}(\.[0-9]{1,3}){3}$")
+                if [ -n "$PUB_IP" ]; then METHOD="wget ${svc}"; break 2; fi
+            fi
+        done
+    done
+    if [ -z "$PUB_IP" ] && command -v dig >/dev/null 2>&1; then
+        PUB_IP=$(dig +short +time=3 myip.opendns.com @resolver1.opendns.com 2>/dev/null | head -1 | grep -oE "^[0-9]{1,3}(\.[0-9]{1,3}){3}$")
+        [ -n "$PUB_IP" ] && METHOD="dig opendns"
+    fi
+    if [ -z "$PUB_IP" ]; then
+        HAVE_CURL=no; command -v curl >/dev/null 2>&1 && HAVE_CURL=yes
+        HAVE_WGET=no; command -v wget >/dev/null 2>&1 && HAVE_WGET=yes
+        HAVE_DIG=no;  command -v dig  >/dev/null 2>&1 && HAVE_DIG=yes
+        METHOD="failed (curl=$HAVE_CURL wget=$HAVE_WGET dig=$HAVE_DIG)"
+    fi
+    echo "${PUB_IP}|${EGRESS_IF}|${METHOD}"
+'
+
+# Populate NODE_PUBLIC_IP[] and NODE_EGRESS_IF[] for every online node.
+# Used at startup so the cluster overview can display the columns.
+# Sets the global EGRESS_METHODS[] map too, for the dedicated egress action.
+declare -A EGRESS_METHODS
+egress_probe_all_nodes() {
+    info "Probing egress public IPs (5s timeout per node)..."
+    local n
+    for n in "${CLUSTER_NODES[@]}"; do
+        if [[ "${NODE_ONLINE[$n]:-0}" != "1" ]]; then
+            NODE_PUBLIC_IP[$n]="-"
+            NODE_EGRESS_IF[$n]="-"
+            EGRESS_METHODS[$n]="offline"
+            continue
+        fi
+        local result pub_ip egress_if method
+        if [[ "$n" == "$THIS_HOST" ]]; then
+            result=$(bash -c "$EGRESS_PROBE" 2>/dev/null || true)
+        else
+            result=$(ssh -o ConnectTimeout=5 \
+                         -o StrictHostKeyChecking=accept-new \
+                         -o BatchMode=yes \
+                         "root@${NODE_IP[$n]:-$n}" "$EGRESS_PROBE" 2>/dev/null || true)
+        fi
+        if [[ -z "$result" ]]; then
+            NODE_PUBLIC_IP[$n]="?"
+            NODE_EGRESS_IF[$n]="?"
+            EGRESS_METHODS[$n]="ssh failed"
+        else
+            IFS='|' read -r pub_ip egress_if method <<< "$result"
+            NODE_PUBLIC_IP[$n]="${pub_ip:-?}"
+            NODE_EGRESS_IF[$n]="${egress_if:-?}"
+            EGRESS_METHODS[$n]="${method:-?}"
+        fi
+    done
+}
+
 show_cluster_overview() {
     echo
     printf '  %s%s%s%s Cluster: %s %s%s%s%s\n' \
@@ -508,10 +603,10 @@ show_cluster_overview() {
         "$CLUSTER_NAME" \
         "$G_HBAR_HEAVY" "$G_HBAR_HEAVY" "$G_HBAR_HEAVY" "$NC"
     echo
-    printf "  %-12s %-10s %-7s %-7s %-12s %-12s\n" \
-        "Node" "Status" "CTs" "VMs" "Free RAM" "Free Disk"
-    printf "  %-12s %-10s %-7s %-7s %-12s %-12s\n" \
-        "----" "------" "---" "---" "--------" "---------"
+    printf "  %-12s %-10s %-7s %-7s %-10s %-10s %-17s %-10s\n" \
+        "Node" "Status" "CTs" "VMs" "Free RAM" "Free Disk" "Public IP" "Egress IF"
+    printf "  %-12s %-10s %-7s %-7s %-10s %-10s %-17s %-10s\n" \
+        "----" "------" "---" "---" "--------" "---------" "---------" "---------"
     for n in "${CLUSTER_NODES[@]}"; do
         local stcol pad
         if [[ "${NODE_ONLINE[$n]}" == "1" ]]; then
@@ -520,12 +615,14 @@ show_cluster_overview() {
             stcol="${RED}${G_CROSS} offline${NC}"; pad=$((10 - 9))
         fi
         (( pad < 0 )) && pad=0
-        printf "  %-12s ${stcol}%*s %-7s %-7s %-12s %-12s\n" \
+        printf "  %-12s ${stcol}%*s %-7s %-7s %-10s %-10s %-17s %-10s\n" \
             "$n" "$pad" "" \
             "[${NODE_CT_COUNT[$n]}]" \
             "[${NODE_VM_COUNT[$n]}]" \
             "${NODE_FREE_RAM_GB[$n]} GB" \
-            "${NODE_FREE_DISK_GB[$n]} GB"
+            "${NODE_FREE_DISK_GB[$n]} GB" \
+            "${NODE_PUBLIC_IP[$n]:-?}" \
+            "${NODE_EGRESS_IF[$n]:-?}"
     done
     echo
 }
@@ -540,16 +637,14 @@ top_menu() {
         show_cluster_overview
         echo "  What would you like to do?"
         echo
-        printf '  %s1)%s Configure a container           %s change ID, hostname, VLAN, IP, and/or node\n' "$GREEN" "$NC" "$G_DASH"
+        printf '  %s1)%s Configure a container           %s change ID, hostname, VLAN, IP, MAC, and/or node\n' "$GREEN" "$NC" "$G_DASH"
         printf '  %s2)%s Refresh cluster overview        %s re-poll cluster state\n' "$CYAN" "$NC" "$G_DASH"
-        printf '  %s3)%s Show egress public IPs          %s check WAN IP per node\n' "$CYAN" "$NC" "$G_DASH"
         echo "  q) Quit"
         echo
         read -rp "  Choice: " CHOICE
         case "$CHOICE" in
             1) action_configure ;;
-            2) discover_cluster ;;
-            3) action_show_egress ;;
+            2) discover_cluster; egress_probe_all_nodes ;;
             q|Q) info "Exiting."; exit 0 ;;
             *) warn "Invalid choice." ;;
         esac
@@ -729,7 +824,7 @@ id_in_use() {
 }
 
 update_net0_in_config() {
-    local conf="$1" new_ip="$2" new_vlan="$3"
+    local conf="$1" new_ip="$2" new_vlan="$3" new_mac="${4:-}"
     local current_line new_line
     current_line=$(awk '/^net0:/ {sub(/^net0: */, ""); print; exit}' "$conf")
     new_line="$current_line"
@@ -748,6 +843,13 @@ update_net0_in_config() {
             new_line="${new_line},tag=${new_vlan}"
         fi
     fi
+    if [[ -n "$new_mac" ]]; then
+        if echo "$new_line" | grep -q 'hwaddr='; then
+            new_line=$(echo "$new_line" | sed -E "s|hwaddr=[^,]+|hwaddr=${new_mac}|")
+        else
+            new_line="${new_line},hwaddr=${new_mac}"
+        fi
+    fi
 
     if [[ $DRY_RUN -eq 1 ]]; then
         dry "Would update net0 in $conf:"
@@ -757,6 +859,32 @@ update_net0_in_config() {
         sed -i "s|^net0:.*|net0: $new_line|" "$conf"
     fi
     log_file "net0 updated in $conf: $current_line  -->  $new_line"
+}
+
+# Generate a Proxmox-style MAC address (BC:24:11:XX:XX:XX prefix).
+# Uses /dev/urandom for the random bytes — RANDOM is biased and predictable.
+generate_mac() {
+    local b4 b5 b6
+    if [[ -r /dev/urandom ]]; then
+        read -r b4 b5 b6 < <(od -An -N3 -tx1 /dev/urandom | tr -d ' ' | sed 's/\(..\)\(..\)\(..\)/\1 \2 \3/')
+    else
+        b4=$(printf '%02x' $(( RANDOM & 0xff )))
+        b5=$(printf '%02x' $(( RANDOM & 0xff )))
+        b6=$(printf '%02x' $(( RANDOM & 0xff )))
+    fi
+    printf 'BC:24:11:%s:%s:%s\n' "${b4^^}" "${b5^^}" "${b6^^}"
+}
+
+# Extract the current MAC from a config file's net0 line.
+get_current_mac() {
+    local conf="$1"
+    awk '/^net0:/ {
+        if (match($0, /hwaddr=[A-Fa-f0-9:]+/)) {
+            s = substr($0, RSTART+7, RLENGTH-7)
+            print s
+        }
+        exit
+    }' "$conf"
 }
 
 # Update the hostname: line in the CT config file.
@@ -855,124 +983,6 @@ EOF
     echo "echo \"Rollback complete: CT is now $old_id\"" >> "$f"
     chmod +x "$f"
 }
-
-action_show_egress() {
-    echo
-    banner "Egress Public IP per Node"
-    echo
-    info "Querying each node's outbound WAN IP (5s timeout each)..."
-    echo
-
-    printf "  ${CYAN}%-12s %-18s %-12s %s${NC}\n" \
-        "Node" "Public IP" "Egress IF" "Service / note"
-    printf "  %-12s %-18s %-12s %s\n" \
-        "----" "---------" "---------" "------------"
-
-    local collected_ips=()
-
-    # Remote probe — a single self-contained shell snippet that we run either
-    # locally or via SSH. It tries multiple methods to get the public IP and
-    # echoes a pipe-delimited result: PUBLIC_IP|EGRESS_IF|METHOD
-    # If no IP can be obtained, PUBLIC_IP is empty and METHOD describes why.
-    local probe='
-        EGRESS_IF=$(ip -4 route get 8.8.8.8 2>/dev/null | grep -oE "dev [^ ]+" | head -1 | cut -d" " -f2)
-        EGRESS_IF=${EGRESS_IF:-?}
-        PUB_IP=""
-        METHOD=""
-        for svc in ifconfig.me api.ipify.org ifconfig.co icanhazip.com; do
-            for proto in https http; do
-                if command -v curl >/dev/null 2>&1; then
-                    RAW=$(curl -4 -s --max-time 5 "${proto}://${svc}" 2>/dev/null)
-                    PUB_IP=$(echo "$RAW" | head -1 | tr -d "[:space:]" | grep -oE "^[0-9]{1,3}(\.[0-9]{1,3}){3}$")
-                    if [ -n "$PUB_IP" ]; then METHOD="curl ${svc}"; break 2; fi
-                fi
-                if command -v wget >/dev/null 2>&1; then
-                    RAW=$(wget -qO- --timeout=5 "${proto}://${svc}" 2>/dev/null)
-                    PUB_IP=$(echo "$RAW" | head -1 | tr -d "[:space:]" | grep -oE "^[0-9]{1,3}(\.[0-9]{1,3}){3}$")
-                    if [ -n "$PUB_IP" ]; then METHOD="wget ${svc}"; break 2; fi
-                fi
-            done
-        done
-        if [ -z "$PUB_IP" ] && command -v dig >/dev/null 2>&1; then
-            PUB_IP=$(dig +short +time=3 myip.opendns.com @resolver1.opendns.com 2>/dev/null | head -1 | grep -oE "^[0-9]{1,3}(\.[0-9]{1,3}){3}$")
-            [ -n "$PUB_IP" ] && METHOD="dig opendns"
-        fi
-        if [ -z "$PUB_IP" ]; then
-            HAVE_CURL=no; command -v curl >/dev/null 2>&1 && HAVE_CURL=yes
-            HAVE_WGET=no; command -v wget >/dev/null 2>&1 && HAVE_WGET=yes
-            HAVE_DIG=no; command -v dig >/dev/null 2>&1 && HAVE_DIG=yes
-            METHOD="failed (curl=$HAVE_CURL wget=$HAVE_WGET dig=$HAVE_DIG)"
-        fi
-        echo "${PUB_IP}|${EGRESS_IF}|${METHOD}"
-    '
-
-    for n in "${CLUSTER_NODES[@]}"; do
-        if [[ "${NODE_ONLINE[$n]}" == "0" ]]; then
-            printf "  %-12s ${RED}%-18s${NC} %-12s %s\n" "$n" "<offline>" "-" "-"
-            continue
-        fi
-
-        local result="" ssh_err=""
-        if [[ "$n" == "$THIS_HOST" ]]; then
-            result=$(bash -c "$probe" 2>/dev/null || true)
-        else
-            # Use the cluster-registered IP from /etc/pve/.members rather than
-            # hostname — avoids 'No route to host' when DNS or /etc/hosts is
-            # missing entries for a freshly joined node.
-            local target_ip="${NODE_IP[$n]:-$n}"
-            local err_tmp
-            err_tmp=$(mktemp)
-            result=$(ssh -o ConnectTimeout=5 \
-                         -o StrictHostKeyChecking=accept-new \
-                         -o PasswordAuthentication=no \
-                         -o KbdInteractiveAuthentication=no \
-                         "root@$target_ip" "$probe" 2>"$err_tmp" || true)
-            ssh_err=$(cat "$err_tmp")
-            rm -f "$err_tmp"
-        fi
-
-        if [[ -z "$result" ]]; then
-            # SSH itself failed — surface the actual error
-            local reason="ssh failed"
-            if [[ -n "$ssh_err" ]]; then
-                # Compress error to one short line for the table
-                reason=$(echo "$ssh_err" | head -1 | cut -c1-40)
-            fi
-            printf "  %-12s ${YELLOW}%-18s${NC} %-12s %s\n" "$n" "<no response>" "?" "$reason"
-            # Show full SSH error indented below for diagnosis
-            if [[ -n "$ssh_err" ]]; then
-                echo "$ssh_err" | sed 's/^/                                                              /'
-            fi
-            continue
-        fi
-
-        local pub_ip egress_if method
-        IFS='|' read -r pub_ip egress_if method <<< "$result"
-
-        if [[ -n "$pub_ip" ]]; then
-            printf "  %-12s ${GREEN}%-18s${NC} %-12s %s\n" "$n" "$pub_ip" "$egress_if" "$method"
-            collected_ips+=("$pub_ip")
-        else
-            printf "  %-12s ${YELLOW}%-18s${NC} %-12s %s\n" "$n" "<no response>" "$egress_if" "$method"
-        fi
-    done
-
-    echo
-    # Detect divergence using cached IPs
-    if (( ${#collected_ips[@]} > 0 )); then
-        local unique_count
-        unique_count=$(printf '%s\n' "${collected_ips[@]}" | sort -u | wc -l)
-        if (( unique_count > 1 )); then
-            warn "Nodes egress through ${unique_count} different public IPs ${G_DASH} split routing detected."
-        else
-            ok "All online nodes share the same egress public IP."
-        fi
-    fi
-    echo
-    read -rp "  Press Enter to return to menu..." _
-}
-
-
 
 action_configure() {
     if ! select_node 1; then return; fi
@@ -1088,16 +1098,128 @@ action_configure() {
         (( matched == 1 )) || { err "Invalid target"; return; }
     fi
 
+    # ---- Leave source behind? (Copy vs Move) ----
+    # The question makes sense in three situations:
+    #   1. Cross-node move + same ID — backup stays on source, original migrates
+    #   2. Cross-node move + new ID  — backup stays on source under new ID
+    #   3. Same-node + new ID        — local clone (duplicate in place)
+    # Whenever Copy is chosen, the "kept on source" CT needs an ID different
+    # from the one going to the target. We always end up with two distinct IDs.
+    local LEAVE_SOURCE_BEHIND=0
+    local BACKUP_ID=""     # the ID of the stopped backup on $SRC_NODE
+    local SAME_NODE_CLONE=0
+    if [[ "$NEW_ID" != "$SRC_ID" ]] || [[ "$TGT_NODE" != "$SRC_NODE" ]]; then
+        echo
+        info "Operation mode:"
+        echo "  ${G_DASH} ${CYAN}Move${NC}  : source CT $SRC_ID is migrated/renamed and removed from $SRC_NODE"
+        echo "  ${G_DASH} ${CYAN}Copy${NC}  : a stopped backup is left on $SRC_NODE,"
+        echo "             the resulting CT goes to $TGT_NODE (or stays in place for same-node clone)"
+        read -rp "Leave a stopped backup on $SRC_NODE? [y/N]: " LEAVE
+        [[ "${LEAVE,,}" == "y" ]] && LEAVE_SOURCE_BEHIND=1
+
+        if (( LEAVE_SOURCE_BEHIND == 1 )); then
+            # Decide which CT keeps SRC_ID and which CT gets the new ID.
+            #
+            # Case A — user gave a NEW_ID different from SRC_ID:
+            #   The resulting CT keeps NEW_ID, the backup retains SRC_ID.
+            #   We just clone SRC_ID -> NEW_ID, then migrate NEW_ID if needed.
+            #   The "backup" is the untouched source CT at SRC_ID.
+            #   No extra prompt needed.
+            #
+            # Case B — user kept NEW_ID == SRC_ID (so NEW_ID hasn't been set
+            # to anything different) AND we have a node change:
+            #   The migrated CT keeps SRC_ID on the target; the backup needs
+            #   a NEW ID on the source. Prompt for it.
+            #
+            # Case C — same node, same ID, user wants a copy: impossible
+            # because we required NEW_ID!=SRC_ID OR node change to even
+            # reach this block. Won't happen.
+            if [[ "$NEW_ID" == "$SRC_ID" ]]; then
+                # Case B — node change without ID change. Need a backup ID.
+                echo
+                info "Cross-node move with backup: the migrated CT keeps ID $SRC_ID on $TGT_NODE."
+                info "The backup on $SRC_NODE needs a different ID."
+                local SUGG_BACKUP_ID
+                # Suggest 9XXXX prefix to mark it as a backup (e.g. 22514 -> 92514)
+                if (( SRC_ID < 10000 )); then
+                    SUGG_BACKUP_ID="9${SRC_ID}"
+                elif (( SRC_ID < 100000 )); then
+                    SUGG_BACKUP_ID="9${SRC_ID:1}"
+                else
+                    SUGG_BACKUP_ID="$((SRC_ID + 90000))"
+                fi
+                while true; do
+                    read -rp "Backup CT ID on $SRC_NODE (Enter for suggested $SUGG_BACKUP_ID): " BACKUP_ID
+                    BACKUP_ID="${BACKUP_ID:-$SUGG_BACKUP_ID}"
+                    if ! [[ "$BACKUP_ID" =~ ^[0-9]+$ ]]; then
+                        warn "Invalid ID."
+                        continue
+                    fi
+                    if [[ "$BACKUP_ID" == "$SRC_ID" ]]; then
+                        warn "Backup ID must differ from source ID."
+                        continue
+                    fi
+                    local collision
+                    if collision=$(id_in_use "$BACKUP_ID"); then
+                        warn "Backup ID $BACKUP_ID already in use: $collision"
+                        continue
+                    fi
+                    break
+                done
+                # Same-node clone flag — backup creation happens on source,
+                # then we still migrate the original SRC_ID to TGT_NODE.
+                # Distinguish from Case A which renumbers via clone.
+                SAME_NODE_CLONE=1
+                info "Will clone $SRC_ID ${G_ARROW} $BACKUP_ID on $SRC_NODE (backup), then migrate $SRC_ID to $TGT_NODE."
+            else
+                # Case A — clone SRC_ID -> NEW_ID. Backup IS the original SRC_ID.
+                BACKUP_ID="$SRC_ID"
+                info "Will clone $SRC_ID ${G_ARROW} $NEW_ID; original $SRC_ID stays as backup on $SRC_NODE."
+            fi
+
+            # Same-node + ID change: we don't migrate; both CTs end up on
+            # SRC_NODE. That's the "local clone" use case.
+            if [[ "$TGT_NODE" == "$SRC_NODE" ]]; then
+                info "Same-node clone: both CTs will reside on $SRC_NODE after the operation."
+            fi
+        fi
+    fi
+
+    # ---- MAC address handling ----
+    # LXC migrate, rename, and pct clone all PRESERVE the MAC address by
+    # default (unlike VM clones, which auto-regenerate). Preserving the MAC
+    # is critical for DHCP-assigned IPs: same MAC = same DHCP lease = same IP.
+    # We ask explicitly so the user makes a conscious choice.
+    local CURRENT_MAC NEW_MAC=""
+    CURRENT_MAC=$(get_current_mac "/etc/pve/nodes/$SRC_NODE/lxc/$SRC_ID.conf")
+    echo
+    if (( LEAVE_SOURCE_BEHIND == 1 )); then
+        # In Copy mode, regenerating prevents two CTs sharing the same MAC
+        # if the source is ever started again — but source-stays-stopped is
+        # the intent, so keeping MAC is still safe and DHCP-friendly.
+        info "MAC address: keeping the source MAC ($CURRENT_MAC) preserves the DHCP lease for the new CT."
+        info "             (Source stays stopped, so there's no immediate conflict either way.)"
+    else
+        info "MAC address: keeping the current MAC ($CURRENT_MAC) preserves DHCP-assigned IPs."
+    fi
+    read -rp "Regenerate MAC address for the resulting CT? [y/N]: " REGEN
+    if [[ "${REGEN,,}" == "y" ]]; then
+        NEW_MAC=$(generate_mac)
+        info "New MAC will be: $NEW_MAC"
+    fi
+
     # ---- Determine what's actually changing ----
     local RENUMBER_NEEDED=0
     local MIGRATE_NEEDED=0
     local HOSTNAME_CHANGE=0
     local NETWORK_CHANGE=0
+    local MAC_CHANGE=0
 
     [[ "$NEW_ID" != "$SRC_ID" ]] && RENUMBER_NEEDED=1
     [[ "$TGT_NODE" != "$SRC_NODE" ]] && MIGRATE_NEEDED=1
     [[ -n "$NEW_HOSTNAME" ]] && HOSTNAME_CHANGE=1
     [[ -n "$NEW_VLAN" || -n "$NEW_IP" ]] && NETWORK_CHANGE=1
+    [[ -n "$NEW_MAC" ]] && { MAC_CHANGE=1; NETWORK_CHANGE=1; }
 
     # Abort if nothing is changing
     if (( RENUMBER_NEEDED == 0 && MIGRATE_NEEDED == 0 \
@@ -1159,8 +1281,19 @@ action_configure() {
     echo
     banner "Operation Summary"
     printf "  ${CYAN}%-22s${NC} %s\n" "Source CT:" "$SRC_ID ($HOSTNAME) on $SRC_NODE"
+    if (( LEAVE_SOURCE_BEHIND == 1 )); then
+        if (( SAME_NODE_CLONE == 1 )); then
+            printf "  ${CYAN}%-22s${NC} %s\n" "Mode:" "Copy (backup $BACKUP_ID on $SRC_NODE, original $SRC_ID moves to $TGT_NODE)"
+        else
+            printf "  ${CYAN}%-22s${NC} %s\n" "Mode:" "Copy (source $SRC_ID kept as backup, new CT $NEW_ID created)"
+        fi
+    elif (( RENUMBER_NEEDED == 1 )) || (( MIGRATE_NEEDED == 1 )); then
+        printf "  ${CYAN}%-22s${NC} %s\n" "Mode:" "Move (source removed)"
+    else
+        printf "  ${CYAN}%-22s${NC} %s\n" "Mode:" "In-place edit"
+    fi
     if (( RENUMBER_NEEDED == 1 )); then
-        printf "  ${CYAN}%-22s${NC} %s ${G_ARROW} %s\n" "Renumber:" "$SRC_ID" "$NEW_ID"
+        printf "  ${CYAN}%-22s${NC} %s ${G_ARROW} %s\n" "New CT ID:" "$SRC_ID" "$NEW_ID"
     fi
     if (( HOSTNAME_CHANGE == 1 )); then
         printf "  ${CYAN}%-22s${NC} %s ${G_ARROW} %s\n" "Hostname change:" "${HOSTNAME:-<unset>}" "$NEW_HOSTNAME"
@@ -1171,8 +1304,13 @@ action_configure() {
     if [[ -n "$NEW_IP" ]]; then
         printf "  ${CYAN}%-22s${NC} %s ${G_ARROW} %s\n" "IP change:" "${IP_RAW:-<none>}" "$NEW_IP"
     fi
+    if (( MAC_CHANGE == 1 )); then
+        printf "  ${CYAN}%-22s${NC} %s ${G_ARROW} %s\n" "MAC change:" "${CURRENT_MAC:-<unknown>}" "$NEW_MAC"
+    else
+        printf "  ${CYAN}%-22s${NC} %s\n" "MAC preserved:" "${CURRENT_MAC:-<unknown>}"
+    fi
     if (( MIGRATE_NEEDED == 1 )); then
-        printf "  ${CYAN}%-22s${NC} %s ${G_ARROW} %s\n" "Migrate:" "$SRC_NODE" "$TGT_NODE"
+        printf "  ${CYAN}%-22s${NC} %s ${G_ARROW} %s\n" "Target node:" "$SRC_NODE" "$TGT_NODE"
     fi
     printf "  ${CYAN}%-22s${NC} %s\n" "Update jobs.cfg:" "$([[ "${UPDATE_JOBS^^}" == "Y" ]] && echo YES || echo no)"
     printf "  ${CYAN}%-22s${NC} %s\n" "Dry run:" "$([[ $DRY_RUN -eq 1 ]] && echo YES || echo no)"
@@ -1241,7 +1379,124 @@ action_configure() {
         fi
     fi
 
-    # 2. Migrate (must run on the source node; CT is now stopped)
+    # 2a. CLONE PATH (Copy mode — source kept as stopped backup)
+    # Two sub-cases:
+    #   Case A — user picked a NEW_ID different from SRC_ID:
+    #     Clone SRC_ID -> NEW_ID locally on $SRC_NODE.
+    #     SRC_ID remains untouched as the backup.
+    #     If target differs, migrate NEW_ID to $TGT_NODE.
+    #   Case B — user kept the same ID (NEW_ID == SRC_ID) and changed node:
+    #     Clone SRC_ID -> BACKUP_ID locally on $SRC_NODE — this becomes the
+    #     backup. Then migrate the original SRC_ID to $TGT_NODE.
+    #
+    # In both cases the clone uses --full 1 (real copy, not linked).
+    if (( LEAVE_SOURCE_BEHIND == 1 )); then
+        if (( SAME_NODE_CLONE == 1 )); then
+            # Case B: clone SRC_ID -> BACKUP_ID on source (becomes backup),
+            # then migrate the original SRC_ID to target.
+            info "Cloning CT $SRC_ID ${G_ARROW} $BACKUP_ID on $SRC_NODE (backup, full clone)..."
+            if ! run "${SRC_PREFIX:+$SRC_PREFIX }pct clone $SRC_ID $BACKUP_ID --full 1"; then
+                err "pct clone failed. Source CT $SRC_ID untouched, no backup created."
+                return
+            fi
+            log "Backup clone complete: $BACKUP_ID on $SRC_NODE."
+
+            info "Migrating original CT $SRC_ID from $SRC_NODE to $TGT_NODE..."
+            if ! run "${SRC_PREFIX:+$SRC_PREFIX }pct migrate $SRC_ID $TGT_NODE"; then
+                err "pct migrate failed for $SRC_ID. Backup $BACKUP_ID exists on $SRC_NODE."
+                err "Recovery options:"
+                err "  - Keep current state and retry migrate manually:"
+                err "      ${SRC_PREFIX:+$SRC_PREFIX }pct migrate $SRC_ID $TGT_NODE"
+                err "  - Roll back the backup creation:"
+                err "      ${SRC_PREFIX:+$SRC_PREFIX }pct destroy $BACKUP_ID"
+                return
+            fi
+
+            # Post-migration cleanup for original (same as Move path)
+            if [[ $DRY_RUN -eq 0 ]]; then
+                info "Verifying source-side cleanup of original $SRC_ID on $SRC_NODE..."
+                local src_lv="vm-${SRC_ID}-disk-0"
+                local i=0 lv_exists=""
+                while (( i < 15 )); do
+                    lv_exists=$($SRC_PREFIX lvs --noheadings -o lv_name "pve/$src_lv" 2>/dev/null | tr -d ' ' || true)
+                    [[ -z "$lv_exists" ]] && break
+                    sleep 1
+                    i=$(( i + 1 ))
+                done
+                if [[ -n "$lv_exists" ]]; then
+                    warn "Source LV pve/$src_lv still present after migration — attempting force-remove..."
+                    $SRC_PREFIX lvchange -an -f "pve/$src_lv" 2>/dev/null || true
+                    sleep 2
+                    if $SRC_PREFIX lvremove -f "pve/$src_lv" 2>/dev/null; then
+                        log "Source LV force-removed successfully."
+                    else
+                        err "Could NOT remove source LV pve/$src_lv on $SRC_NODE."
+                    fi
+                else
+                    log "Source LV removed cleanly."
+                fi
+                $SRC_PREFIX "rm -rf /var/lib/lxc/$SRC_ID" 2>/dev/null || true
+            fi
+
+            # In Case B, the resulting (migrated) CT keeps SRC_ID on target.
+            # Set MIGRATE_NEEDED=0 so the standard Move block below is skipped;
+            # we've handled the migrate already. RENUMBER_NEEDED stays 0 (it
+            # was already 0 since NEW_ID == SRC_ID).
+            MIGRATE_NEEDED=0
+        else
+            # Case A: clone SRC_ID -> NEW_ID on source. Source stays as backup.
+            info "Cloning CT $SRC_ID ${G_ARROW} $NEW_ID on $SRC_NODE (full clone)..."
+            if ! run "${SRC_PREFIX:+$SRC_PREFIX }pct clone $SRC_ID $NEW_ID --full 1"; then
+                err "pct clone failed. Source CT $SRC_ID untouched."
+                return
+            fi
+            log "Clone complete: $SRC_ID ${G_ARROW} $NEW_ID on $SRC_NODE."
+
+            # Migrate the clone to target node if needed.
+            if (( MIGRATE_NEEDED == 1 )); then
+                info "Migrating clone $NEW_ID from $SRC_NODE to $TGT_NODE..."
+                if ! run "${SRC_PREFIX:+$SRC_PREFIX }pct migrate $NEW_ID $TGT_NODE"; then
+                    err "pct migrate failed for clone $NEW_ID. Clone remains on $SRC_NODE."
+                    err "Manual cleanup options:"
+                    err "  - To delete the clone: ${SRC_PREFIX:+$SRC_PREFIX }pct destroy $NEW_ID"
+                    err "  - To migrate manually: ${SRC_PREFIX:+$SRC_PREFIX }pct migrate $NEW_ID $TGT_NODE"
+                    return
+                fi
+
+                # Verify clone's source-side cleanup on $SRC_NODE
+                if [[ $DRY_RUN -eq 0 ]]; then
+                    info "Verifying clone source-side cleanup on $SRC_NODE..."
+                    local clone_lv="vm-${NEW_ID}-disk-0"
+                    local i=0 lv_exists=""
+                    while (( i < 15 )); do
+                        lv_exists=$($SRC_PREFIX lvs --noheadings -o lv_name "pve/$clone_lv" 2>/dev/null | tr -d ' ' || true)
+                        [[ -z "$lv_exists" ]] && break
+                        sleep 1
+                        i=$(( i + 1 ))
+                    done
+                    if [[ -n "$lv_exists" ]]; then
+                        warn "Clone source-side LV pve/$clone_lv still present — attempting force-remove..."
+                        $SRC_PREFIX lvchange -an -f "pve/$clone_lv" 2>/dev/null || true
+                        sleep 2
+                        if $SRC_PREFIX lvremove -f "pve/$clone_lv" 2>/dev/null; then
+                            log "Clone source-side LV force-removed successfully."
+                        else
+                            err "Could NOT remove clone source-side LV pve/$clone_lv on $SRC_NODE."
+                        fi
+                    else
+                        log "Clone source-side LV removed cleanly."
+                    fi
+                    $SRC_PREFIX "rm -rf /var/lib/lxc/$NEW_ID" 2>/dev/null || true
+                fi
+            fi
+
+            # Case A is done — bypass the standard Move blocks below.
+            RENUMBER_NEEDED=0
+            MIGRATE_NEEDED=0
+        fi
+    fi
+
+    # 2b. MOVE PATH — migrate (must run on the source node; CT is now stopped)
     if (( MIGRATE_NEEDED == 1 )); then
         info "Migrating CT $SRC_ID from $SRC_NODE to $TGT_NODE..."
         # Always offline migrate now that we've explicitly stopped + settled.
@@ -1295,8 +1550,17 @@ action_configure() {
         info "CT now lives on $TGT_NODE — subsequent ops via SSH to ${NODE_IP[$TGT_NODE]:-$TGT_NODE}"
     fi
 
-    # 3. Apply hostname / VLAN / IP
-    local conf_now="/etc/pve/nodes/$TGT_NODE/lxc/$SRC_ID.conf"
+    # 3. Apply hostname / VLAN / IP / MAC
+    # Path depends on which mode finished above:
+    #   - Move:               config at SRC_ID until step 4 renames it
+    #   - Copy / Case A:      config at NEW_ID on target (clone landed there)
+    #   - Copy / Case B:      config at SRC_ID on target (original migrated)
+    local conf_now
+    if (( LEAVE_SOURCE_BEHIND == 1 )) && (( SAME_NODE_CLONE == 0 )); then
+        conf_now="/etc/pve/nodes/$TGT_NODE/lxc/$NEW_ID.conf"
+    else
+        conf_now="/etc/pve/nodes/$TGT_NODE/lxc/$SRC_ID.conf"
+    fi
     local NEW_VLAN_FOR_CONFIG=""
     [[ -n "$NEW_VLAN" && "$NEW_VLAN" != "-" ]] && NEW_VLAN_FOR_CONFIG="$NEW_VLAN"
     if (( HOSTNAME_CHANGE == 1 )); then
@@ -1305,7 +1569,7 @@ action_configure() {
     fi
     if (( NETWORK_CHANGE == 1 )); then
         info "Applying network changes..."
-        update_net0_in_config "$conf_now" "$NEW_IP" "$NEW_VLAN_FOR_CONFIG"
+        update_net0_in_config "$conf_now" "$NEW_IP" "$NEW_VLAN_FOR_CONFIG" "$NEW_MAC"
     fi
 
     # 4. Renumber (LV rename + config rename)
@@ -1422,11 +1686,18 @@ action_configure() {
     echo
     printf "  ${CYAN}%-12s${NC} %s\n" "CT ID:"    "$FINAL_ID"
     printf "  ${CYAN}%-12s${NC} %s\n" "Node:"     "$TGT_NODE"
+    if (( LEAVE_SOURCE_BEHIND == 1 )); then
+        if (( SAME_NODE_CLONE == 1 )); then
+            printf "  ${CYAN}%-12s${NC} %s\n" "Backup:" "CT $BACKUP_ID kept as stopped backup on $SRC_NODE"
+        else
+            printf "  ${CYAN}%-12s${NC} %s\n" "Backup:" "CT $SRC_ID kept as stopped backup on $SRC_NODE"
+        fi
+    fi
     [[ -n "$rb_file" ]] && printf "  ${CYAN}%-12s${NC} %s\n" "Rollback:" "$rb_file"
     printf "  ${CYAN}%-12s${NC} %s\n" "Logfile:"  "$LOGFILE"
     echo
 
-    log_file "Operation complete: $SRC_ID -> $FINAL_ID on $TGT_NODE"
+    log_file "Operation complete: $SRC_ID -> $FINAL_ID on $TGT_NODE (leave=$LEAVE_SOURCE_BEHIND, same_node_clone=$SAME_NODE_CLONE, backup_id=${BACKUP_ID:-none})"
 
     # Every successful operation leaves the CT stopped — script explicitly
     # stops, waits, then migrates/renumbers offline. Prompt user to start.
@@ -1435,9 +1706,11 @@ action_configure() {
     if [[ $DRY_RUN -eq 0 ]] && (( NEEDS_START == 1 )); then
         local action_verb="Start"
         local pct_cmd="pct start $FINAL_ID"
-        # If only network/hostname changed (no renumber, no migrate) and CT
-        # was already running, offer restart instead of start.
-        if (( RENUMBER_NEEDED == 0 && MIGRATE_NEEDED == 0 )) \
+        # If only network/hostname changed (no renumber, no migrate, no clone)
+        # and CT was already running, offer restart instead of start.
+        # In Copy mode (LEAVE_SOURCE_BEHIND), the clone is brand new so
+        # it must always be Start, never Restart.
+        if (( RENUMBER_NEEDED == 0 && MIGRATE_NEEDED == 0 && LEAVE_SOURCE_BEHIND == 0 )) \
            && [[ "$SEL_CT_STATUS" == "running" ]]; then
             action_verb="Restart"
             pct_cmd="pct restart $FINAL_ID"
@@ -1463,5 +1736,6 @@ action_configure() {
 
 # ---------- Main ----------
 discover_cluster
+egress_probe_all_nodes
 preflight_check
 top_menu
