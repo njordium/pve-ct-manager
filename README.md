@@ -1,23 +1,25 @@
-**An interactive Bash tool for managing LXC containers across a Proxmox VE cluster — renumber, migrate, change hostname/VLAN/IP, and verify cluster consistency from any node.**
+**An interactive Bash tool for managing LXC containers across a Proxmox VE cluster — renumber, migrate, change hostname/VLAN/IP/MAC, clone with backup, and verify cluster consistency from any node.**
 
 <img width="902" height="513" alt="Screenshot2026-06-27 at 16 24 52" src="https://github.com/user-attachments/assets/d7571356-fec4-463c-81a0-b68a72853e37" />
 
 ## Why this exists
 
-Proxmox VE's `pct` CLI is powerful but rigid. Renumbering a container means stopping it, renaming its LVM volume, editing the cluster-synced config, and remembering to update backup jobs — all without a single command that does it safely. Migrating a container with `nesting=1` regularly races the kernel's mount teardown, leaving the source LV held open and the destination filesystem appearing "corrupted." When something goes wrong mid-operation, you end up with ghost containers: running processes with no config, LVs that won't `lvremove`, and a cluster state that disagrees with reality.
+Proxmox VE's `pct` CLI is powerful but rigid. Renumbering a container means stopping it, renaming its LVM volume, editing the cluster-synced config, and remembering to update backup jobs — all without a single command that does it safely. Migrating a container with `nesting=1` regularly races the kernel's mount teardown, leaving the source LV held open and the destination filesystem appearing "corrupted." When something goes wrong mid-operation, you end up with ghost containers: running processes with no config, LVs that won't `lvremove`, and a cluster state that disagrees with reality. And `pct migrate` always removes the source — there's no built-in "leave a backup behind during the cutover."
 
-This script handles the entire workflow interactively from any node in the cluster — with pre-flight consistency checks, hostname/VLAN/IP edits, nesting-aware migration timing, post-rename verification, and rollback snippets for every mutation.
+This script handles the entire workflow interactively from any node in the cluster — with pre-flight consistency checks, hostname/VLAN/IP/MAC edits, nesting-aware migration timing, post-rename verification, optional Copy mode that leaves a stopped backup via `pct clone`, and rollback snippets for every mutation.
 
 ## What it does
 
-- **Cluster-aware operation** — discovers all nodes via `pvesh`, displays CT/VM counts and free resources, routes commands to the node that owns the CT via SSH
-- **Unified configure flow** — change container ID, hostname, VLAN tag, IP address, and/or target node in one operation; Enter at any prompt to keep the current value
+- **Cluster-aware operation** — discovers all nodes via `pvesh`, displays CT/VM counts, free resources, and per-node public IP / egress interface; routes commands to the node that owns the CT via SSH
+- **Unified configure flow** — change container ID, hostname, VLAN tag, IP address, MAC address, and/or target node in one operation; Enter at any prompt to keep the current value
+- **Move or Copy** — when a CT ID or target node changes, choose Move (current behaviour: source removed) or Copy (source kept as a stopped backup via `pct clone --full 1`). Covers cross-node move with backup on source, cross-node move with new ID, and same-node local clone
+- **MAC address control** — explicit prompt to regenerate or preserve. Defaults to preserve, which keeps DHCP-assigned IPs intact across renumber and migration. When regenerating, uses `/dev/urandom` and the Proxmox `BC:24:11` OUI prefix
 - **Safe renumbering** — stops the CT, renames the LVM volume on the owning node, updates the cluster-synced config, optionally updates backup jobs, and writes a rollback snippet
 - **Nesting-aware migration** — detects `nesting=1` / `fuse` features, explicitly stops the CT, waits 10 seconds for kernel mount namespaces to release, then polls the LV's `lv_attr` open flag before migrating — avoiding the `lvremove ... filesystem in use` race that plagues `pct migrate --restart`
 - **Pre-flight consistency checks** — on startup, scans every node for orphan LVs (no config references), misplaced LVs (LV on node X but config on node Y), and orphan `/var/lib/lxc/<id>/` directories; pauses for acknowledgement on issues
 - **Post-rename verification** — mounts the renamed LV read-only and confirms `/etc/hostname` inside matches the PVE config; surfaces mismatches before the CT starts
 - **Post-migration cleanup** — verifies the source-side LV is gone after `pct migrate`; force-removes if PVE's own cleanup failed (which it does for nesting CTs); removes leftover `/var/lib/lxc/<id>/` on the source
-- **Egress IP diagnostic** — queries each online node's outbound public IP via curl/wget/dig fallback chain; flags split-routing when nodes egress through different WAN IPs
+- **Egress IP diagnostic** — public IP and egress interface per node, shown as dedicated columns on the cluster overview; updated on every Refresh
 - **Rollback snippets** — every renumber, hostname change, and network change generates a bash script under `/var/log/pct-renumber-rollback/` that reverses the operation
 - **Dry-run mode** — preview every command without executing
 - **No external dependencies** — pure Bash + tools already installed on every PVE node
@@ -66,27 +68,26 @@ The script presents this menu after the startup consistency check:
 ```
   ━━━ Cluster: Rivendell ━━━
 
-  Node         Status     CTs     VMs     Free RAM     Free Disk
-  ----         ------     ---     ---     --------     ---------
-  aiwendil     ● online   [27]    [0]     75 GB        562 GB
-  alatar       ● online   [1]     [0]     29 GB        345 GB
-  curumo       ● online   [20]    [1]     23 GB        138 GB
+  Node         Status     CTs     VMs     Free RAM   Free Disk  Public IP         Egress IF
+  ----         ------     ---     ---     --------   ---------  ---------         ---------
+  aiwendil     ● online   [27]    [0]     75 GB      562 GB     203.0.113.42      vmbr0
+  alatar       ● online   [1]     [0]     29 GB      348 GB     203.0.113.42      vmbr0
+  curumo       ● online   [20]    [1]     23 GB      138 GB     203.0.113.42      vmbr0
 
   What would you like to do?
 
-  1) Configure a container           — change ID, hostname, VLAN, IP, and/or node
+  1) Configure a container           — change ID, hostname, VLAN, IP, MAC, and/or node
   2) Refresh cluster overview        — re-poll cluster state
-  3) Show egress public IPs          — check WAN IP per node
   q) Quit
 ```
 
 ### Typical workflow
 
-1. Run the script — startup automatically discovers the cluster and runs a consistency check
+1. Run the script — startup automatically discovers the cluster, probes egress IPs, and runs a consistency check
 2. **1** — Configure a container; select a node, pick the CT, and answer the prompts
 3. Review the operation summary; confirm with `y`
-4. Watch the explicit stop → settle → migrate → rename → verify steps
-5. When prompted, decide whether to start the CT on the target node
+4. Watch the explicit stop → settle → migrate/clone → rename → verify steps
+5. When prompted, decide whether to start the resulting CT on the target node
 
 
 ### Configure flow
@@ -119,9 +120,34 @@ New container ID (Enter to keep 22512): 22513
   3) curumo        free: 23 GB RAM, 138 GB disk
 
 Target node (Enter to keep aiwendil): 2
+
+[→] Operation mode:
+  — Move  : source CT 22512 is migrated/renamed and removed from aiwendil
+  — Copy  : a stopped backup is left on aiwendil,
+            the resulting CT goes to alatar (or stays in place for same-node clone)
+Leave a stopped backup on aiwendil? [y/N]: n
+
+[→] MAC address: keeping the current MAC (BC:24:11:38:59:D9) preserves DHCP-assigned IPs.
+Regenerate MAC address for the resulting CT? [y/N]: n
 ```
 
-The operation summary then shows exactly what will change — only the attributes you modified are listed. If nothing changed, the script returns to the menu without doing anything.
+The operation summary then shows exactly what will change — only the attributes you modified are listed, plus the chosen Mode and the MAC state. If nothing changed, the script returns to the menu without doing anything.
+
+---
+
+## Move vs Copy
+
+Whenever the Configure flow detects a CT ID change, a target-node change, or both, it asks whether to leave a stopped backup behind. The three Copy variants are:
+
+| Scenario | Backup | Resulting CT | Mechanism |
+| --- | --- | --- | --- |
+| New ID + new node | Source CT keeps its ID on source node (stopped) | New ID on target node | `pct clone src → new_id`, then `pct migrate new_id` |
+| Same ID + new node | Backup gets a new ID on source node (suggested `9XXXX` prefix) | Original ID on target node | `pct clone src → backup_id` on source, then `pct migrate src_id` |
+| New ID + same node | Source CT keeps its ID (stopped) | New ID on same node | `pct clone src → new_id` (local) |
+
+Move is the default and is unchanged from earlier versions — the source disappears after the operation completes.
+
+Copy uses `pct clone --full 1` (full clone, not linked) so the backup is self-contained and can be removed later without affecting the live CT.
 
 ---
 
@@ -131,9 +157,11 @@ The operation summary then shows exactly what will change — only the attribute
 
 A single `pvesh get /cluster/resources --output-format yaml` call returns nodes, containers, VMs, and storage in one query. The script parses the YAML in pure awk (no jq dependency) and builds in-memory maps of CT counts, VM counts, free RAM, free disk, and a node→IP map sourced from `/etc/pve/.members`. The IP map is what makes cross-node SSH reliable even when `/etc/hosts` or DNS is stale — PVE's authoritative node IPs always work.
 
+Egress public IP and egress interface are probed per node at startup (and on every Refresh) via curl → wget → dig fallback. The results populate dedicated columns on the cluster overview.
+
 ### Command routing
 
-Every `pct` command runs on the node that owns the container. `pct stop`, `pct status`, and `pct migrate` execute on the source node; `lvrename`, post-migration `pct` calls, and `/var/lib/lxc/` cleanup execute on the target node. A single `ssh_prefix()` helper produces consistent SSH options (`BatchMode=yes`, `ConnectTimeout=5`, `StrictHostKeyChecking=accept-new`) for every remote invocation.
+Every `pct` command runs on the node that owns the container. `pct stop`, `pct status`, `pct migrate`, and `pct clone` execute on the source node; `lvrename`, post-migration `pct` calls, and `/var/lib/lxc/` cleanup execute on the target node. A single `ssh_prefix()` helper produces consistent SSH options (`BatchMode=yes`, `ConnectTimeout=5`, `StrictHostKeyChecking=accept-new`) for every remote invocation.
 
 ### Nesting-aware migration
 
@@ -153,6 +181,10 @@ PVE's `pct migrate --restart` races the kernel for containers with `features: ne
 3. Poll the LV's `lv_attr` open flag for up to 15 additional seconds
 4. Plain `pct migrate` (no `--restart`) — clean offline migration
 5. Post-migration verification polls the source LV; if it persists, force-deactivates and removes it
+
+### MAC address preservation
+
+LXC `pct migrate`, `pct clone`, and the script's own config-rename all preserve the MAC address by default (unlike VM clones, which auto-regenerate). Keeping the MAC means DHCP-assigned IPs stay stable across renumbering and migration. The script asks explicitly at every Configure run so the choice is conscious; regenerated MACs use `/dev/urandom` with the Proxmox `BC:24:11` OUI prefix.
 
 ### Pre-flight consistency check
 
@@ -176,23 +208,9 @@ Every mutation writes a bash script to `/var/log/pct-renumber-rollback/` contain
 
 ## Diagnostics
 
-### Egress public IP per node
+### Egress public IP on the cluster overview
 
-Menu option **3** queries each online node's outbound WAN IP using a fallback chain of curl → wget → dig. Useful for verifying NAT consistency across the cluster and spotting nodes that route through a different WAN (e.g. a WireGuard exit VLAN).
-
-```
-━━━ Egress Public IP per Node ━━━
-
-[→] Querying each node's outbound WAN IP (5s timeout each)...
-
-  Node         Public IP          Egress IF    Service / note
-  ----         ---------          ---------    ------------
-  aiwendil     203.0.113.42      vmbr0        curl ifconfig.me
-  alatar       203.0.113.42      vmbr0        curl ifconfig.me
-  curumo       203.0.113.42      vmbr0        curl ifconfig.me
-
-[✓] All online nodes share the same egress public IP.
-```
+The cluster overview's **Public IP** and **Egress IF** columns are populated automatically at startup and refreshed on demand via menu option 2. Useful for verifying NAT consistency across the cluster and spotting nodes that route through a different WAN (e.g. a WireGuard exit VLAN). If nodes egress through different public IPs, the Refresh action surfaces a split-routing warning.
 
 ### Dry-run mode
 
@@ -228,6 +246,18 @@ ssh root@<node> "mkdir -p /mnt/sniff && mount -o ro /dev/pve/vm-<id>-disk-0 /mnt
 
 If it's a real CT that lost its config, restore the config from the rollback snippet or reconstruct it manually. If it's stale data, force-deactivate then remove.
 
+**DHCP-assigned IP changed after renumber or migration**
+
+The MAC must have been regenerated. Check the Operation Summary log — if it shows `MAC change: ... → ...`, the script regenerated rather than preserved. Re-run and answer `n` (default) at the "Regenerate MAC address?" prompt to keep the existing MAC.
+
+**Clone fails with `unable to create CT — disk volume … already exists`**
+
+The target ID has a stale LV on the source node from a previous failed operation. Run pre-flight via menu option 2 (Refresh) — orphan LVs are detected and reported. Clean up with:
+
+```bash
+ssh root@<node> "lvchange -an -f pve/vm-<id>-disk-0 && lvremove -f pve/vm-<id>-disk-0"
+```
+
 **Trailing characters after coloured output (e.g. `running1`, `online1`)**
 
 Some terminal emulators (notably ZOC in default mode) mangle ANSI SGR reset sequences, echoing the last input character. Use `--no-color` to disable colour output:
@@ -248,7 +278,7 @@ The script sets `stty erase '^?'` at startup. If your terminal sends `^H` instea
 
 Pull requests are welcome. For significant changes please open an issue first to discuss the approach.
 
-Please test against a multi-node PVE 9 cluster before submitting changes that affect migration or LVM operations.
+Please test against a multi-node PVE 9 cluster before submitting changes that affect migration, clone, or LVM operations.
 
 ---
 
